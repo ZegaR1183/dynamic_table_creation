@@ -101,6 +101,18 @@ def load_data(table_name: str, table_dml: str, **context):
     try:
         hook.run(truncate_sql)
         logging.info(f"Таблица {table_name} очищена.")
+    except Exception as e:
+        logging.error(f"Ошибка при очистке таблицы {table_name}: {e}")
+        raise
+
+    # Вставка данных в таблицу
+    if not df.empty:
+        try:
+            hook.insert_rows(table_name, df.values.tolist(), df.columns.tolist(), replace=True)
+            logging.info(f"Данные успешно загружены в таблицу {table_name}")
+        except Exception as e:
+            logging.error(f"Ошибка при вставке данных в таблицу {table_name}: {e}")
+            raise
 
 
 def export_to_s3(table_name: str, **context):
@@ -173,15 +185,11 @@ with DAG(
 
     # Создаем стартовую задачу
     start_task = EmptyOperator(
-        task_id='start',
-        dag=dag,
-        python_callable=lambda: logging.info("DAG стартовал")
+        task_id='start'
     )
 
     end_task = EmptyOperator(
-        task_id='end',
-        dag=dag,
-        python_callable=lambda: logging.info("DAG завершен")
+        task_id='end'
     )
 
     # Динамически создаем задачи для каждой таблицы
