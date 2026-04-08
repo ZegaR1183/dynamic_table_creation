@@ -65,27 +65,18 @@ def create_table(table_name: str, table_ddl: str, **context):
         raise RuntimeError(f"Не удалось создать таблицу {table_name}") from e
     return f"Таблица {table_name} готова"
 
-def load_data(table_name: str, sql_filename: str, **context):
+def load_data(table_name: str, sql_query: str, **context):
     """
     Загружает данные в таблицу с проверкой качества.
     Использует TRUNCATE + INSERT для идемпотентности.
-    Поддерживает Jinja-рендеринг SQL-запросов.
+    Принимает уже прочитанный SQL-запрос (оптимизация).
+    Поддерживает Jinja-рендеринг.
     """
-    base_sql_dir = Variable.get("sql_queries_dir", default_var="/opt/airflow/sql")
-    query_path = os.path.join(base_sql_dir, sql_filename)
     hook = PostgresHook(postgres_conn_id='postgres_default')
-
-    # Чтение SQL
-    try:
-        with open(query_path, 'r', encoding='utf-8') as f:
-            raw_sql = f.read()
-    except Exception as e:
-        logging.error(f"Ошибка чтения SQL-файла {sql_filename}: {e}")
-        raise
 
     # Рендеринг Jinja-шаблона для SQL
     try:
-        template = Template(raw_sql)
+        template = Template(sql_query)
         rendered_sql = template.render(**context)
         logging.info(f"Отрендеренный SQL:\n{rendered_sql}")
     except Exception as e:
@@ -104,10 +95,13 @@ def load_data(table_name: str, sql_filename: str, **context):
         logging.error(f"Запрос для таблицы {table_name} вернул пустой результат.")
         raise ValueError("Пустой результат")
 
-    if 'id' in df.columns and df['id'].duplicated().any():
-        sample = df[df['id'].duplicated(keep=False)].head(5)
-        logging.error(f"Дубликаты по 'id' в {table_name}:\n{sample}")
-        raise ValueError("Обнаружены дубликаты")
+    if 'id' not in df.columns:
+        logging.warning(f"В таблице {table_name} нет колонки 'id'. Пропуск проверки дубликатов.")
+    else:
+        if df['id'].duplicated().any():
+            sample = df[df['id'].duplicated(keep=False)].head(5)
+            logging.error(f"Дубликаты по 'id' в {table_name}:\n{sample}")
+            raise ValueError("Обнаружены дубликаты")
 
     # Очистка и вставка
     truncate_sql = f"TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE"
@@ -120,7 +114,10 @@ def load_data(table_name: str, sql_filename: str, **context):
     return "Загрузка успешна"
 
 def export_to_s3(table_name: str, s3_bucket: str, s3_key_prefix: str, **context):
-    """Экспорт данные в S3."""
+    """
+    Экспортирует данные из таблицы PostgreSQL в S3 в формате CSV.
+    Путь в S3: {s3_key_prefix}/{table_name}/{ds}/{table_name}.csv
+    """
     hook = PostgresHook(postgres_conn_id='postgres_default')
     s3_hook = S3Hook(aws_conn_id='aws_default')
     ds = context['ds']
@@ -139,7 +136,7 @@ def export_to_s3(table_name: str, s3_bucket: str, s3_key_prefix: str, **context)
             string_data=csv_buffer.getvalue(),
             bucket_name=s3_bucket,
             key=key,
-            replace=True
+            replace=True  # Перезаписывает, если файл существует
         )
         logging.info(f"Данные из {table_name} успешно экспортированы в s3://{s3_bucket}/{key}")
         context['ti'].xcom_push(key="exported_rows", value=len(df))
@@ -177,24 +174,27 @@ with DAG(
     max_active_runs=1
 ) as dag:
 
-    # Создаем стартовую задачу
+    # Старт и завершение
     start_task = EmptyOperator(task_id='start')
     end_task = EmptyOperator(task_id='end')
 
-    # Динамически создаем задачи для каждой таблицы
+    # Списки задач
     tasks = []
+    final_tasks = []
 
+    # Динамическое создание задач
     for table_config in configs:
         table_name = table_config['table_name']
         ddl_filename = table_config['ddl_file']
         sql_filename = table_config['table_dml']
         export_enabled = table_config.get('need_to_export', False)
 
-        # Читаем содержимое SQL-файлов
+        # Читаем SQL-файлы один раз
         try:
             ddl_content = read_sql_file(ddl_filename)
+            dml_content = read_sql_file(sql_filename)
         except Exception as e:
-            logging.error(f"Ошибка загрузки DDL для {table_name}: {e}")
+            logging.error(f"Ошибка загрузки SQL-файлов для {table_name}: {e}")
             raise
 
         # Задача: создать таблицу
@@ -208,7 +208,10 @@ with DAG(
         load_task = PythonOperator(
             task_id=f'load_data_{table_name}',
             python_callable=load_data,
-            op_kwargs={'table_name': table_name, 'sql_filename': sql_filename},
+            op_kwargs={
+                'table_name': table_name,
+                'sql_query': dml_content
+            },
         )
 
         # Задача: экспорт в S3 (если нужно)
@@ -224,11 +227,14 @@ with DAG(
             )
             # Устанавливаем зависимости
             create_task >> load_task >> export_task
+            final_tasks.append(export_task)
             tasks.extend([create_task, load_task, export_task])
         else:
             # Устанавливаем зависимости без экспорта
             create_task >> load_task
+            final_tasks.append(load_task)
             tasks.extend([create_task, load_task])
 
     # Граф зависимостей
-    start_task >> tasks >> end_task
+    start_task >> [t for t in set(tasks)]  # Все задачи после старта
+    final_tasks >> end_task  # Только финальные задачи перед завершением
