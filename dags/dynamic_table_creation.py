@@ -1,6 +1,6 @@
 """
-DAG с динамической генерацией задач на основе Python-списка словарей.
-Обеспечивает идемпотентное создание таблиц, контроль качества данных и опциональную выгрузку в S3.
+DAG с динамической генерацией задач на основе внешней конфигурации.
+Поддерживает Jinja-шаблоны в SQL-запросах для гибкости и адаптивности.
 """
 
 from datetime import datetime, timedelta
@@ -9,150 +9,139 @@ from airflow.operators.python import PythonOperator
 from airflow.hooks.postgres_hook import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.operators.empty import EmptyOperator
+from airflow.models import Variable
 import logging
 import pandas as pd
 import io
+import json
+import os
+from jinja2 import Template
 
-# КОНФИГУРАЦИЯ ТАБЛИЦ
-config = [
-    {
-        'table_name': 'test',
-        'table_ddl': 'CREATE TABLE IF NOT EXISTS test (id bigint, category varchar(255), amount decimal(10,2))',
-        'table_dml': 'SELECT id, category, SUM(amount) as amount FROM raw_t GROUP BY id, category',
-        'need_to_export': True,
-        's3_bucket': 'my-data-lake',
-        's3_key_prefix': 'exports/',
-    },
-    {
-        'table_name': 'test_2',
-        'table_ddl': 'CREATE TABLE IF NOT EXISTS test_2 (id bigint, category varchar(255), amount decimal(10,2))',
-        'table_dml': 'SELECT id, category, SUM(amount) as amount FROM raw_t GROUP BY id, category',
-        'need_to_export': False,
-        # s3 параметры не требуются
-    },
-    # Пример добавления новой таблицы:
-    # {
-    #     'table_name': 'sales_summary',
-    #     'table_ddl': 'CREATE TABLE IF NOT EXISTS sales_summary (region VARCHAR, total_sales DECIMAL, sale_date DATE)',
-    #     'table_dml': 'SELECT region, SUM(sales) AS total_sales, sale_date FROM raw_sales GROUP BY region, sale_date',
-    #     'need_to_export': True,
-    #     's3_bucket': 'analytics-archive',
-    #     's3_key_prefix': 'daily/sales/'
-    # },
-]
+# Путь к конфигурации
+CONFIG_PATH = Variable.get("table_config_path", default_var="/opt/airflow/config/table_configs.json")
+
+# Загружаем конфигурацию
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        raise FileNotFoundError(f"Конфигурационный файл не найден: {CONFIG_PATH}")
+
+    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+# Читаем SQL из файла
+def read_sql_file(filename: str) -> str:
+    base_sql_dir = Variable.get("sql_queries_dir", default_var="/opt/airflow/sql")
+    filepath = os.path.join(base_sql_dir, filename)
+
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"SQL-файл не найден: {filepath}")
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return f.read().strip()
 
 # ФУНКЦИИ ДЛЯ ТАСКОВ
 def create_table(table_name: str, table_ddl: str, **context):
     """
     Создает таблицу, если она не существует. Идемпотентная операция.
+    Поддерживает Jinja-рендеринг DDL.
     """
     hook = PostgresHook(postgres_conn_id='postgres_default')
     logging.info(f"Создание/проверка таблицы: {table_name}")
-    logging.info(f"DDL: {table_ddl}")
+
+    # Рендеринг Jinja-шаблона для DDL
+    try:
+        template = Template(table_ddl)
+        rendered_ddl = template.render(**context)
+        logging.info(f"Отрендеренный DDL: {rendered_ddl}")
+    except Exception as e:
+        logging.error(f"Ошибка рендеринга DDL для {table_name}: {e}")
+        raise
 
     try:
-        hook.run(table_ddl, True)
+        hook.run(rendered_ddl, True)
         logging.info(f"Таблица {table_name} создана или уже существует")
     except Exception as e:
         logging.error(f"Ошибка при создании таблицы {table_name}: {e}")
-        raise
+        raise RuntimeError(f"Не удалось создать таблицу {table_name}") from e
     return f"Таблица {table_name} готова"
 
-
-def load_data(table_name: str, table_dml: str, **context):
+def load_data(table_name: str, sql_filename: str, **context):
     """
     Загружает данные в таблицу с проверкой качества.
     Использует TRUNCATE + INSERT для идемпотентности.
+    Поддерживает Jinja-рендеринг SQL-запросов.
     """
+    base_sql_dir = Variable.get("sql_queries_dir", default_var="/opt/airflow/sql")
+    query_path = os.path.join(base_sql_dir, sql_filename)
     hook = PostgresHook(postgres_conn_id='postgres_default')
-    rendered_dml = context['task'].render_template(table_dml, context)
 
-    logging.info(f"=== Начало задачи: load_data_{table_name} ===")
-    logging.info(f"Выполняется запрос загрузки:\n{rendered_dml}")
+    # Чтение SQL
+    try:
+        with open(query_path, 'r', encoding='utf-8') as f:
+            raw_sql = f.read()
+    except Exception as e:
+        logging.error(f"Ошибка чтения SQL-файла {sql_filename}: {e}")
+        raise
+
+    # Рендеринг Jinja-шаблона для SQL
+    try:
+        template = Template(raw_sql)
+        rendered_sql = template.render(**context)
+        logging.info(f"Отрендеренный SQL:\n{rendered_sql}")
+    except Exception as e:
+        logging.error(f"Ошибка рендеринга SQL для {table_name}: {e}")
+        raise
 
     try:
-        df = hook.get_pandas_df(rendered_dml)
+        df = hook.get_pandas_df(rendered_sql)
     except Exception as e:
-        logging.error(f"Ошибка при выполнении SQL-запроса для {table_name}: {str(e)}")
-        logging.error(f"Запрос: {rendered_dml}")
+        logging.error(f"Ошибка при выполнении SQL-запроса для {table_name}: {e}")
+        logging.error(f"Запрос: \n{rendered_sql}")
         raise ValueError(f"Не удалось выполнить запрос для таблицы {table_name}: {e}") from e
 
     # Проверка качества данных
     if df.empty:
-        error_msg = f"Запрос для таблицы {table_name} вернул пустой результат."
-        logging.error(error_msg)
-        logging.warning(f"SQL-запрос, вернувший 0 строк:\n{rendered_dml}")
-        raise ValueError(error_msg)
+        logging.error(f"Запрос для таблицы {table_name} вернул пустой результат.")
+        raise ValueError("Пустой результат")
 
-    logging.info(f"Получено {len(df)} строк для загрузки.")
+    if 'id' in df.columns and df['id'].duplicated().any():
+        sample = df[df['id'].duplicated(keep=False)].head(5)
+        logging.error(f"Дубликаты по 'id' в {table_name}:\n{sample}")
+        raise ValueError("Обнаружены дубликаты")
 
-    # Проверка дубликатов по id (если колонка существует)
-    if 'id' in df.columns:
-        duplicated_count = df['id'].duplicated().sum()
-        if duplicated_count > 0:
-            sample_duplicates = df[df['id'].duplicated(keep=False)].head(10)
-            logging.error(f"Обнаружено {duplicated_count} дубликатов по 'id' в таблице {table_name}.")
-            logging.error(f"Пример дубликатов:\n{sample_duplicates.to_string()}")
-            raise ValueError(f"Дубликаты по 'id' обнаружены в таблице {table_name}")
-
-    # Идемпотентная очистка
+    # Очистка и вставка
     truncate_sql = f"TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE"
-    logging.info(f"Выполнение очистки таблицы: {truncate_sql}")
-    try:
-        hook.run(truncate_sql)
-        logging.info(f"Таблица {table_name} очищена.")
-    except Exception as e:
-        logging.error(f"Ошибка при очистке таблицы {table_name}: {e}")
-        raise
+    hook.run(truncate_sql)
+    engine = hook.get_sqlalchemy_engine()
+    df.to_sql(table_name, con=engine, if_exists='append', index=False)
 
-    # Вставка данных в таблицу
-    if not df.empty:
-        try:
-            hook.insert_rows(table_name, df.values.tolist(), df.columns.tolist(), replace=True)
-            logging.info(f"Данные успешно загружены в таблицу {table_name}")
-        except Exception as e:
-            logging.error(f"Ошибка при вставке данных в таблицу {table_name}: {e}")
-            raise
+    logging.info(f"Загружено {len(df)} строк в {table_name}")
+    context['ti'].xcom_push(key="row_count", value=len(df))
+    return "Загрузка успешна"
 
-
-def export_to_s3(table_name: str, **context):
-    """
-    Экспортирует данные таблицы в S3 в формате CSV с использованием Airflow S3Hook.
-    Путь: s3://bucket/prefix/table_name/execution_date/table_name.csv
-    """
-    # Получаем конфигурацию текущей таблицы
-    table_config = next((cfg for cfg in config if cfg['table_name'] == table_name), None)
-    if not table_config or not table_config.get('need_to_export'):
-        logging.info(f"Экспорт отключён для {table_name}")
-        return "Пропущено"
-
-    bucket_name = table_config.get('s3_bucket')
-    key_prefix = table_config.get('s3_key_prefix', 'exports/')
-    ds = context['ds']  # execution date
-
+def export_to_s3(table_name: str, s3_bucket: str, s3_key_prefix: str, **context):
+    """Экспорт данные в S3."""
     hook = PostgresHook(postgres_conn_id='postgres_default')
-    s3_hook = S3Hook(aws_conn_id='aws_default')  # использует Airflow Connection
-
-    logging.info(f"Экспорт таблицы {table_name} в S3: s3://{bucket_name}/{key_prefix}{table_name}/{ds}/")
-
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    ds = context['ds']
+    key = f"{s3_key_prefix.rstrip('/')}/{table_name}/{ds}/{table_name}.csv"
     df = hook.get_pandas_df(f"SELECT * FROM {table_name}")
+
     if df.empty:
         logging.warning(f"Нет данных для экспорта из {table_name}")
-        return "Пропущено: нет данных"
+        return "Пропущено"
 
     csv_buffer = io.StringIO()
     df.to_csv(csv_buffer, index=False)
 
-    key = f"{key_prefix}{table_name}/{ds}/{table_name}.csv"
-
     try:
         s3_hook.load_string(
             string_data=csv_buffer.getvalue(),
-            bucket_name=bucket_name,
+            bucket_name=s3_bucket,
             key=key,
             replace=True
         )
-        logging.info(f"Данные из {table_name} успешно экспортированы в s3://{bucket_name}/{key}")
+        logging.info(f"Данные из {table_name} успешно экспортированы в s3://{s3_bucket}/{key}")
         context['ti'].xcom_push(key="exported_rows", value=len(df))
     except Exception as e:
         logging.error(f"Ошибка при экспорте {table_name} в S3: {e}")
@@ -160,6 +149,13 @@ def export_to_s3(table_name: str, **context):
 
     return f"Экспорт завершён: {len(df)} строк"
 
+# ЗАГРУЗКА КОНФИГУРАЦИИ
+try:
+    config_data = load_config()
+    configs = config_data.get("tables", [])
+except Exception as e:
+    logging.error(f"Не удалось загрузить конфигурацию: {e}")
+    raise
 
 # ОСНОВНОЙ DAG
 default_args = {
@@ -167,62 +163,64 @@ default_args = {
     'depends_on_past': False,
     'start_date': datetime(2024, 1, 1),
     'email_on_failure': False,
-    'email_on_retry': False,
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
-    'on_failure_callback': lambda context: logging.error(f"Задача провалилась: {context['task_instance'].task_id}")
 }
 
 with DAG(
     'dynamic_table_creation',
     default_args=default_args,
-    description='DAG с динамической генерацией задач: создание, загрузка, опциональный экспорт',
+    description='Динамический ETL: конфиг из JSON, SQL с Jinja-поддержкой',
     schedule_interval='@daily',
     catchup=False,
-    tags=['dynamic', 'etl', 'quality', 's3'],
+    tags=['dynamic', 'etl', 'configurable', 'jinja'],
     max_active_runs=1
 ) as dag:
 
     # Создаем стартовую задачу
-    start_task = EmptyOperator(
-        task_id='start'
-    )
-
-    end_task = EmptyOperator(
-        task_id='end'
-    )
+    start_task = EmptyOperator(task_id='start')
+    end_task = EmptyOperator(task_id='end')
 
     # Динамически создаем задачи для каждой таблицы
     tasks = []
 
-    for table_config in config:
+    for table_config in configs:
         table_name = table_config['table_name']
-        table_ddl = table_config['table_ddl']
-        table_dml = table_config['table_dml']
+        ddl_filename = table_config['ddl_file']
+        sql_filename = table_config['table_dml']
+        export_enabled = table_config.get('need_to_export', False)
+
+        # Читаем содержимое SQL-файлов
+        try:
+            ddl_content = read_sql_file(ddl_filename)
+        except Exception as e:
+            logging.error(f"Ошибка загрузки DDL для {table_name}: {e}")
+            raise
 
         # Задача: создать таблицу
         create_task = PythonOperator(
             task_id=f'create_table_{table_name}',
             python_callable=create_table,
-            op_kwargs={'table_name': table_name, 'table_ddl': table_ddl},
-            dag=dag
+            op_kwargs={'table_name': table_name, 'table_ddl': ddl_content},
         )
 
         # Задача: загрузить данные
         load_task = PythonOperator(
             task_id=f'load_data_{table_name}',
             python_callable=load_data,
-            op_kwargs={'table_name': table_name, 'table_dml': table_dml},
-            dag=dag
+            op_kwargs={'table_name': table_name, 'sql_filename': sql_filename},
         )
 
         # Задача: экспорт в S3 (если нужно)
-        if table_config.get('need_to_export'):
+        if export_enabled:
             export_task = PythonOperator(
                 task_id=f'export_{table_name}',
                 python_callable=export_to_s3,
-                op_kwargs={'table_name': table_name},
-                dag=dag
+                op_kwargs={
+                    'table_name': table_name,
+                    's3_bucket': table_config['s3_bucket'],
+                    's3_key_prefix': table_config.get('s3_key_prefix', 'exports/')
+                },
             )
             # Устанавливаем зависимости
             create_task >> load_task >> export_task
@@ -233,6 +231,4 @@ with DAG(
             tasks.extend([create_task, load_task])
 
     # Граф зависимостей
-    start_task >> tasks
-    for task in tasks:
-        task >> end_task
+    start_task >> tasks >> end_task
